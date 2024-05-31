@@ -1,0 +1,22 @@
+body {
+  font-family: "Roboto", sans-serif;
+}
+
+body {
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+}
+
+main {
+  flex: 1 0 auto;
+}
+
+ul.circlelist li {
+  list-style-type: circle;
+  margin-left: 5%;
+}
+
+footer .row {
+  margin-bottom: 0;
+}
