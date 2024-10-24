@@ -1,3 +1,3 @@
 ﻿# nicknad.github.io
 
-a small website purposly left simple
+a small website purposely left simple
