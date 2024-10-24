@@ -6,6 +6,22 @@ body {
   display: flex;
   min-height: 100vh;
   flex-direction: column;
+  background-color: #AFDDE5;
+}
+header div .row
+,header .container {
+  display: flex;
+}
+
+.equal-margin h4 {
+  margin-top: 15px;
+  margin-right: 2em;
+  font-family:palatino linotype,serif;
+}
+
+.equal-margin a {
+  margin-top: 18px;
+  padding: 5px 10px;
 }
 
 main {
@@ -15,6 +31,10 @@ main {
 ul.circlelist li {
   list-style-type: circle;
   margin-left: 5%;
+}
+
+footer {
+  background-color: #AFDDE5;
 }
 
 footer .row {
