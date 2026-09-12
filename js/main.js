@@ -1,5 +1,3 @@
-M.AutoInit();
-
-$(document).ready(function(){
-    $('.parallax').parallax();
+document.querySelectorAll("[data-year]").forEach(function (el) {
+  el.textContent = new Date().getFullYear();
 });
