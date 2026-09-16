@@ -29,73 +29,235 @@
     <article class="article container-narrow">
       <header class="article-header">
         <h1>Local-first observability with otel-sqlite</h1>
-        <p class="article-meta">September 10, 2026 · 3 min read</p>
+        <p class="article-meta">September 16, 2026 · 6 min read</p>
       </header>
 
       <div class="article-content">
         <p>
           I built
           <a href="https://github.com/nicknad/otel-sqlite" target="_blank" rel="noopener">otel-sqlite</a>
-          to learn two things properly: Rust, and the OpenTelemetry Protocol. The
-          idea was small 'take OTLP log records over gRPC, write them to a local
-          SQLite file', but it forced real concepts instead of tutorials.
+          to learn two things properly: Rust and the OpenTelemetry Protocol. The
+          idea was small: take OTLP log records over gRPC and write them to a local
+          SQLite file. That was enough to force real concepts instead of tutorials.
         </p>
 
-        <h2>OTLP concepts</h2>
+        <h2>The spec, briefly</h2>
         <p>
-          The spec is the hard part. A request is nested: <code>ResourceLogs</code>
-          → <code>ScopeLogs</code> → <code>LogRecord</code>, where the resource
-          and scope carry metadata that applies to every record under them. Body
-          and attributes are <code>AnyValue</code>, a oneof that can nest arrays
-          and key-value lists. Trace and span IDs are raw bytes with strict
-          validity rules, and severity is an enum with unspecified values.
+          The spec lives on the
+          <a href="https://opentelemetry.io/docs/specs/otlp/" target="_blank" rel="noopener">OpenTelemetry site</a>.
+          In short, an export request is a ResourceLogs → ScopeLogs → LogRecord
+          tree. I mapped the resource level to a <code>log_resource</code> row
+          (service, host, schema URL, attributes as JSON) referenced by
+          <code>log_event.resource_id</code>, denormalized scope name/version onto
+          the event row, and flattened record fields into columns: timestamps,
+          severity, trace/span IDs as blobs, body and attributes as canonical JSON.
         </p>
-        <p>What I took away:</p>
-        <ul>
-          <li>OTLP's service contract: which RPCs to serve, what 2xx guarantees, what <code>UNIMPLEMENTED</code> means.
-          </li>
-          <li>How to preserve <code>AnyValue</code> without silently converting it — structured bodies become canonical
-            JSON.</li>
-          <li>Why malformed trace/span IDs should reject a whole request instead of being zero-filled.</li>
-          <li>All-or-nothing admission: a retried request must never duplicate records, so there is no partial success.
-          </li>
-        </ul>
+        <p>
+          Indexes cover the known query paths: <code>timestamp_ns</code> for time
+          ranges and retention, <code>(resource_id, timestamp_ns)</code> for
+          per-service windows, and a partial <code>(trace_id, timestamp_ns)</code>
+          index for trace lookup. Search runs on a contentless FTS5 table
+          (<code>logs_fts</code>) kept in sync by insert and delete triggers, so
+          new logs are searchable immediately and retention prunes leave no stale
+          entries. A <code>logs</code> view joins event and resource for ad-hoc
+          SQL.
+        </p>
+
+        <h2>What I took away</h2>
+        <p>
+          OTLP is a service contract before it is a data format. Three gRPC
+          services exist (logs, traces, metrics), each with an <code>Export</code>
+          RPC, and a server must answer <code>UNIMPLEMENTED</code> for the ones it
+          does not serve instead of faking success. I serve logs only.
+          <code>OK</code> means the server took responsibility for the data, but
+          the spec stops short of promising durability, so I defined that myself:
+          a successful export means every record has committed to SQLite before
+          the response goes out.
+        </p>
+        <p>
+          The second lesson was <code>AnyValue</code>, the oneof behind bodies and
+          attributes: string, bool, int, double, bytes, array, or nested key-value
+          list. The lazy mapping stringifies all of it, which quietly turns numbers
+          into text and arrays into unqueryable blobs. I store structured values as
+          canonical JSON instead: sorted keys, hex-encoded bytes, non-finite
+          doubles as <code>null</code>. Anything that still cannot be represented
+          is either rejected or counted as an explicit loss, never silently
+          converted.
+        </p>
+        <p>
+          Trace and span IDs have strict rules: 16 and 8 bytes, and all-zero means
+          invalid. Zero-filling a malformed ID would invent a correlation that can
+          never match a trace, so a bad ID rejects the entire request with
+          <code>INVALID_ARGUMENT</code>, giving the sender a loud failure it can
+          fix instead of a silent bad join.
+        </p>
+        <p>
+          That works only because admission is all-or-nothing. OTLP defines a
+          <code>partial_success</code> field, but partial acceptance plus retries
+          duplicates records, and there is no dedup key. So a request is either
+          admitted completely or not at all: ingress reserves capacity for every
+          chunk before issuing commit tickets, and a full queue returns
+          <code>UNAVAILABLE</code> with nothing accepted. Success and
+          nothing-happened are the only outcomes.
+        </p>
 
         <h2>What I learned in Rust</h2>
-        <ul>
-          <li>Ownership across threads: sharing a connection is impossible, so the type system pushes you toward one
-            writer owning it.</li>
-          <li>Bounded channels and backpressure beat unbounded queues, the queue depth becomes a load signal, not a
-            memory leak.</li>
-          <li>Blocking vs async: the writer stays on a blocking thread while ingress runs on tokio; mixing them is a
-            design choice, not an accident.</li>
-          <li><code>rusqlite</code> error codes map cleanly onto retryable, poisonous, and fatal failure classes.</li>
-        </ul>
+        <p>
+          The single writer comes from SQLite, not Rust. Only one writer may hold
+          the database, so writes have to funnel through a single owner. What Rust
+          added was enforcement: <code>Connection</code> is <code>Send</code> but
+          not <code>Sync</code>, so sharing it across tasks does not compile
+          without a mutex, and a mutex on the hot path would just serialize on
+          contention. Moving the connection into one thread and passing owned
+          command messages over a channel makes the ownership transfer itself the
+          concurrency model. Where sharing is genuinely needed (the admission gate
+          every sender clone uses), it is an explicit
+          <code>Arc&lt;Mutex&lt;()&gt;&gt;</code>, impossible to miss.
+        </p>
+        <p>
+          Every hop between stages is bounded and enqueue is non-blocking. A full
+          queue is not an internal error to spin on; it is a signal that the writer
+          is behind, and it reaches the client as <code>UNAVAILABLE</code>. The
+          alternative, an unbounded queue, hides overload until memory pressure
+          turns it into an outage, and the depth reading stops meaning anything. A
+          bound turns "how loaded is this thing?" into a number I can watch.
+        </p>
+        <p>
+          gRPC ingress runs on a tokio multi-thread runtime because requests are
+          IO-bound and numerous, while the writer is synchronous rusqlite on a
+          dedicated blocking thread. Mixing the two is deliberate: async buys
+          concurrency at the edge, and blocking keeps the single writer simple and
+          avoids async scheduling inside the one place where every microsecond is
+          throughput. The subtle part (an admission gate around a crossbeam channel
+          shared with async producers) is confined to the ingress crate, so the
+          rest of the pipeline stays on one model.
+        </p>
+        <p>
+          rusqlite exposes SQLite's error codes, and they map almost directly onto
+          a failure policy: <code>BUSY</code>/<code>LOCKED</code> is retryable with
+          backoff, constraint and binding failures are poisonous to a specific row,
+          and everything else is fatal and should fail loudly rather than be
+          guessed at. Encoding that as an enum means classification happens once,
+          in one place, and each class has defined behavior instead of a match arm
+          repeated at every call site.
+        </p>
 
         <h2>How I designed it</h2>
         <pre
           class="article-pre">OTLP gRPC → bounded ingress queue → insert batcher → bounded command queue → single SQLite writer (WAL) → SQLite</pre>
-        <ul>
-          <li><strong>Single writer.</strong> Exactly one component owns the connection. Everything else produces
-            commands.</li>
-          <li><strong>Bounded queues everywhere.</strong> Full queues return <code>UNAVAILABLE</code> so clients retry;
-            nothing hangs.</li>
-          <li><strong>Durable acknowledgements.</strong> A 2xx means committed: each accepted chunk gets a commit
-            ticket,
-            and handlers wait on the writer's contiguous watermark.</li>
-          <li><strong>Error classification.</strong> Retryable errors back off; poisoned rows are quarantined while
-            healthy rows commit; fatal errors fail pending acks fast instead of silently dropping data.</li>
-          <li><strong>WAL mode.</strong> Reads stay fast while writes stream in; retention is one <code>DELETE</code>,
-            backup is a file copy.</li>
-        </ul>
+        <p>
+          Exactly one component owns the SQLite connection. Ingress turns OTLP into
+          log rows, the batcher groups inserts, and the maintenance worker
+          schedules retention and checkpoints. All of them are just producers of
+          the same bounded command queue. That gives every write a total order,
+          removes lock contention from the hot path, and turns invariants like
+          "retention never races an insert" into a property of the shape instead of
+          a rule to remember.
+        </p>
+        <p>
+          Both queues are bounded and admission is all-or-nothing, so backpressure
+          reaches the client as a retryable status instead of an OOM inside the
+          process. Nothing buffers without limit: not the channel, not the batcher,
+          not the WAL. When a limit is hit, the failure is visible at the edge
+          where it can be acted on, not discovered later in a memory graph.
+        </p>
+        <p>
+          A successful export means committed. Each accepted chunk gets a commit
+          ticket, the writer publishes a contiguous watermark as transactions
+          land, and the handler holds the response until the watermark passes its
+          highest ticket. If the writer or batcher dies, the ledger closes and
+          pending acknowledgements fail fast with <code>UNAVAILABLE</code> instead
+          of hanging. A faster mode that acknowledges on admission exists, but it
+          can lose records in a crash. The trade is named and configurable, not
+          hidden.
+        </p>
+        <p>
+          Failures are classified, not improvised. Retryable transactions
+          re-attempt four times with exponential backoff; a batch poisoned by one
+          bad row is re-run in tolerant mode, so healthy rows commit while
+          offending ones are dropped and counted; a fatal error kills the writer,
+          fails every pending acknowledgement, and lets a supervisor restart. In
+          all three paths the rule is the same: an acknowledgement is only ever
+          sent for data that is actually on disk.
+        </p>
+        <p>
+          WAL mode is what makes the single writer cheap. A commit is an append
+          plus a lock operation rather than an fsync per transaction, so the writer
+          is mostly CPU-bound and readers see a consistent snapshot without
+          blocking. Retention is a batched <code>DELETE</code> that
+          garbage-collects orphaned resources, checkpoints keep the WAL from
+          growing without bound, incremental vacuum returns freed pages without
+          rewriting the file, and backup is a file copy.
+        </p>
 
+        <h2>Testing</h2>
+        <p>
+          A service that promises durability is only as good as the tests that try
+          to break it, so most of the effort went here. The integration tests never
+          mock the pipeline: they boot exactly the wiring of the production binary,
+          drive real OTLP/gRPC over TCP, and then query the SQLite file to validate
+          what landed. The same harness checks backpressure semantics, asserting
+          that a full queue returns <code>UNAVAILABLE</code> for the whole request
+          and that a retried request produces zero duplicate rows.
+        </p>
+        <p>
+          Durability is tested against process death, not just shutdown. One test
+          boots the real binary under closed-loop load, kills it mid-WAL-write,
+          restarts on the same database, and validates. Writer and batcher death
+          are tested independently through environment-gated fault knobs that make
+          each thread exit through its real fatal path. A container-level test
+          docker-kills the sidecar mid-load and restarts on the same volume, and a
+          backup/restore suite runs against the release binary.
+        </p>
+        <p>
+          Two cargo-fuzz targets cover the untrusted-input boundary: one fuzzes the
+          batcher and commit ledger, the other pushes arbitrary bytes through the
+          OTLP export handler (protobuf decode, validation, mapping, enqueue). The
+          invariants are explicit: decodable input must never panic, a rejected
+          request surfaces as <code>INVALID_ARGUMENT</code> rather than an abort,
+          an accepted request never carries partial success, and nothing is
+          enqueued for a rejected one. The seed corpus covers malformed trace and
+          span IDs, deeply nested bodies, unknown severity values, and every
+          <code>AnyValue</code> kind.
+        </p>
+        <p>
+          CI runs the boring things on every change: rustfmt, clippy with warnings
+          denied, the full test suite, cargo-deny for licenses and advisories,
+          cargo-audit, and semgrep rules. It also runs the release-binary crash and
+          backup/restore suites, a fuzz smoke pass, and the backpressure
+          correctness scenario. A longer fuzz run is scheduled nightly. The whole
+          workflow is runnable locally through <code>act</code>, so I can reproduce
+          CI before pushing.
+        </p>
+        <p>
+          Performance has its own harness: an end-to-end client that drives real
+          gRPC through the complete production pipeline and validates the database
+          afterwards, plus Criterion microbenchmarks for mapping, batching,
+          queueing, and transactions so regressions show up per component.
+          Release-mode runs are enforced (a dev build needs an explicit flag), and
+          the published numbers come from the real binary on a real disk, not a
+          tmpfs or a mock.
+        </p>
+        <p>
+          For reference, on a Windows dev machine (release build, WAL +
+          <code>synchronous=NORMAL</code>), the baseline scenario held the full
+          1,000 records/s offered for 60 seconds: 60,000 of 60,000 rows present,
+          zero duplicates, and acknowledge latency p50 29 ms / p99 85 ms while
+          waiting for durable commits. The write path benchmark reaches about
+          180,000 records/s at 1,000-record transactions, with a marginal cost of
+          roughly 5.7 µs per record, and the entire ingress-to-writer path adds
+          under 2% on top at production batch sizes. In a 100,000 rec/s offered
+          ramp, the ingress queue peaked at 11 of 50,000 chunks, so the closed-loop
+          client ran out of concurrency before the writer ran out of capacity. Both
+          runs, with exact revision and configuration, are committed under
+          <code>results/</code> in the repo.
+        </p>
         <h2>Trade-offs</h2>
         <p>
           Deliberately single-node: no clustering, no dashboards, throughput
-          bounded by one disk. If you need to slice terabytes across a fleet, use
-          a platform built for that. If you need to answer "what happened on this
-          box last Tuesday?" from the terminal with plain SQL, a file is hard to
-          beat.
+          bounded by one disk. If you need to slice terabytes across a fleet, use a
+          platform built for that. If you need to answer "what happened on this box
+          last Tuesday?" from the terminal with plain SQL, a file is hard to beat.
         </p>
 
         <h2>Try it</h2>
