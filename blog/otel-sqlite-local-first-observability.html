@@ -34,48 +34,73 @@
 
       <div class="article-content">
         <p>
-          Observability tooling is easy to set up and even easier to overpay for. For side
-          projects, labs, and small services, a managed platform is often more
-          infrastructure than the problem needs. I wanted the standard OpenTelemetry
-          pipeline — OTLP in, structured logs out — with a sink I could inspect with plain
-          SQL. That idea became
-          <a href="https://github.com/nicknad/otel-sqlite" target="_blank" rel="noopener">otel-sqlite</a>.
+          I built
+          <a href="https://github.com/nicknad/otel-sqlite" target="_blank" rel="noopener">otel-sqlite</a>
+          to learn two things properly: Rust, and the OpenTelemetry Protocol. The
+          idea was small 'take OTLP log records over gRPC, write them to a local
+          SQLite file', but it forced real concepts instead of tutorials.
         </p>
 
-        <h2>What it does</h2>
+        <h2>OTLP concepts</h2>
         <p>
-          otel-sqlite receives OpenTelemetry log records and writes them to a local SQLite
-          database. Because the data lands in a single file, you can query it with anything
-          that speaks SQL — the <code>sqlite3</code> CLI, DuckDB, or your own tooling — and
-          back it up by copying one file.
+          The spec is the hard part. A request is nested: <code>ResourceLogs</code>
+          → <code>ScopeLogs</code> → <code>LogRecord</code>, where the resource
+          and scope carry metadata that applies to every record under them. Body
+          and attributes are <code>AnyValue</code>, a oneof that can nest arrays
+          and key-value lists. Trace and span IDs are raw bytes with strict
+          validity rules, and severity is an enum with unspecified values.
         </p>
-
-        <h2>Why SQLite</h2>
-        <p>SQLite is a remarkably good fit for append-heavy log storage:</p>
+        <p>What I took away:</p>
         <ul>
-          <li>No server to run, no ports to expose, no connection strings to manage.</li>
-          <li>WAL mode keeps reads fast while writes stream in.</li>
-          <li>Retention is a single <code>DELETE</code> statement, and archival is a file copy.</li>
+          <li>OTLP's service contract: which RPCs to serve, what 2xx guarantees, what <code>UNIMPLEMENTED</code> means.
+          </li>
+          <li>How to preserve <code>AnyValue</code> without silently converting it — structured bodies become canonical
+            JSON.</li>
+          <li>Why malformed trace/span IDs should reject a whole request instead of being zero-filled.</li>
+          <li>All-or-nothing admission: a retried request must never duplicate records, so there is no partial success.
+          </li>
         </ul>
-        <p>
-          That makes it a natural fit for local development, self-hosted services, audit
-          trails, and air-gapped environments where sending telemetry off-box is not an
-          option.
-        </p>
+
+        <h2>What I learned in Rust</h2>
+        <ul>
+          <li>Ownership across threads: sharing a connection is impossible, so the type system pushes you toward one
+            writer owning it.</li>
+          <li>Bounded channels and backpressure beat unbounded queues, the queue depth becomes a load signal, not a
+            memory leak.</li>
+          <li>Blocking vs async: the writer stays on a blocking thread while ingress runs on tokio; mixing them is a
+            design choice, not an accident.</li>
+          <li><code>rusqlite</code> error codes map cleanly onto retryable, poisonous, and fatal failure classes.</li>
+        </ul>
+
+        <h2>How I designed it</h2>
+        <pre
+          class="article-pre">OTLP gRPC → bounded ingress queue → insert batcher → bounded command queue → single SQLite writer (WAL) → SQLite</pre>
+        <ul>
+          <li><strong>Single writer.</strong> Exactly one component owns the connection. Everything else produces
+            commands.</li>
+          <li><strong>Bounded queues everywhere.</strong> Full queues return <code>UNAVAILABLE</code> so clients retry;
+            nothing hangs.</li>
+          <li><strong>Durable acknowledgements.</strong> A 2xx means committed: each accepted chunk gets a commit
+            ticket,
+            and handlers wait on the writer's contiguous watermark.</li>
+          <li><strong>Error classification.</strong> Retryable errors back off; poisoned rows are quarantined while
+            healthy rows commit; fatal errors fail pending acks fast instead of silently dropping data.</li>
+          <li><strong>WAL mode.</strong> Reads stay fast while writes stream in; retention is one <code>DELETE</code>,
+            backup is a file copy.</li>
+        </ul>
 
         <h2>Trade-offs</h2>
         <p>
-          This is deliberately a single-node tool. It is not a replacement for a production
-          observability platform: there is no clustering, no dashboards, and write
-          throughput is bounded by one disk. If you need to slice terabytes of traces
-          across a fleet, use a platform built for that. If you need to answer "what
-          happened on this box last Tuesday?" without leaving the terminal, a file is hard
-          to beat.
+          Deliberately single-node: no clustering, no dashboards, throughput
+          bounded by one disk. If you need to slice terabytes across a fleet, use
+          a platform built for that. If you need to answer "what happened on this
+          box last Tuesday?" from the terminal with plain SQL, a file is hard to
+          beat.
         </p>
 
         <h2>Try it</h2>
         <p>
-          The source and setup instructions are on
+          Source and setup instructions are on
           <a href="https://github.com/nicknad/otel-sqlite" target="_blank" rel="noopener">GitHub</a>.
         </p>
       </div>
@@ -94,7 +119,8 @@
               d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
           </svg>
         </a>
-        <a href="https://www.linkedin.com/in/nick-nadolski-91697a120/" target="_blank" rel="noopener" aria-label="LinkedIn">
+        <a href="https://www.linkedin.com/in/nick-nadolski-91697a120/" target="_blank" rel="noopener"
+          aria-label="LinkedIn">
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path
               d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
