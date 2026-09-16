@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Building pwsafe: DPAPI, the clipboard, and Windows as the root of trust — Nick Nadolski</title>
+  <meta name="description"
+    content="Notes from building a Windows CLI password safe where DPAPI is the only key, secrets never pass through the terminal, and the clipboard wipes itself." />
+  <link rel="icon" type="image/x-icon" href="../favicon.ico" />
+  <link rel="stylesheet" href="../css/style.css" />
+</head>
+
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="../index.html">Nick Nadolski</a>
+      <nav class="nav" aria-label="Main">
+        <a href="../index.html">Home</a>
+        <a href="../projects.html">Projects</a>
+        <a href="../blogs.html" aria-current="page">Blog</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <article class="article container-narrow">
+      <header class="article-header">
+        <h1>Building pwsafe: DPAPI, the clipboard, and Windows as the root of trust</h1>
+        <p class="article-meta">September 16, 2026 · 7 min read</p>
+      </header>
+
+      <div class="article-content">
+        <p>
+          I built
+          <a href="https://github.com/nicknad/pwsafe" target="_blank" rel="noopener">pwsafe</a>
+          to learn the Windows security surface the way otel-sqlite taught me
+          OTLP: by forcing real constraints instead of tutorials. It is a
+          Windows-only command-line password safe.
+          <code>pwsafe add github</code> generates a password, stores it in a
+          single vault file, and copies it to the clipboard;
+          <code>pwsafe get github</code> copies it again. No master password, no
+          daemon, and no command ever prints a secret to the terminal.
+        </p>
+
+        <h2>Windows is the root of trust</h2>
+        <p>
+          The usual password safe design wraps a vault key with a master
+          passphrase you have to remember, type often, and never reuse. I went
+          the other way: the vault is encrypted with the Windows Data Protection
+          API under the current user. That makes the security boundary the
+          Windows account itself, nothing more and nothing less. It removes the
+          most phishable, most reusable secret from the picture entirely, at the
+          cost of portability. The vault is bound to this user and this machine;
+          it cannot be decrypted elsewhere, and there is no recovery path. It is
+          honest about where the trust sits instead of pretending a second
+          password fixes it.
+        </p>
+
+        <h2>DPAPI is the whole crypto story</h2>
+        <p>
+          The vault is DPAPI-encrypted JSON. Writing uses
+          <code>CryptProtectData</code>, reading uses
+          <code>CryptUnprotectData</code>, both under the current Windows user,
+          with app-specific optional entropy (<code>pwsafe-rs/dpapi/v1</code>)
+          so ciphertext stolen from the vault is useless in another
+          application's context.
+          <code>CRYPTPROTECT_UI_FORBIDDEN</code> is passed so a console program
+          can never block on UI it has no way to show.
+        </p>
+        <p>
+          DPAPI allocates its output with <code>LocalAlloc</code>, which sets
+          the memory-handling rules. The result is copied into a
+          <code>Zeroizing&lt;Vec&lt;u8&gt;&gt;</code>, the DPAPI buffer is
+          zeroized before it is released, and the allocation is freed exactly
+          once with <code>LocalFree</code>. Every one of those steps is a place
+          where plaintext could leak into a heap page that outlives the call.
+        </p>
+        <p>
+          Tests pin the properties I actually care about: a round-trip returns
+          the original bytes, flipping a single bit of ciphertext fails, and
+          protecting with one entropy value and unprotecting with another fails.
+          DPAPI is doing the work, but the test suite is what proves the wrapper
+          around it is not quietly defeating it.
+        </p>
+
+        <h2>The clipboard is the delivery mechanism</h2>
+        <p>
+          Secrets are never printed to stdout or stderr, so the clipboard is not
+          a convenience. It is the only output channel, and it is a hostile one:
+          anything running as the same user can read it, and Windows keeps a
+          history and syncs it to the cloud by default.
+        </p>
+        <p>
+          <code>add</code> and <code>get</code> copy with clipboard history
+          (Win+V) and cloud sync excluded, then wipe after
+          <code>--clear-secs</code> seconds (default 15, maximum 86400) — but
+          only if the clipboard still holds the secret. The check is
+          <code>GetClipboardSequenceNumber</code>, a per-window-station counter:
+          capture it after the copy, sleep, and compare. If the number moved,
+          you copied something else and pwsafe leaves it untouched. If the
+          counter is unavailable, it falls back to reading the text back —
+          zeroized — and comparing. Ctrl+C during the wait keeps the secret on
+          the clipboard. When the state cannot be verified, it refuses to wipe
+          and says so rather than guessing.
+        </p>
+
+        <h2>Secrets never come from argv</h2>
+        <p>
+          Command-line arguments are visible to other processes and end up in
+          shell history, so <code>set</code> never takes a secret as an
+          argument. At a terminal you get a hidden prompt with a confirmation
+          entry; otherwise one line is read from stdin. Piped input is parsed
+          strictly: a trailing <code>\r\n</code>, <code>\n</code>, or
+          <code>\r</code> and a UTF-8 BOM are stripped, while NUL bytes,
+          invalid UTF-8, more than one line, empty input, and oversized input
+          are rejected. The byte gate (16 KiB) is applied before the input is
+          buffered, and the character limit (4096) is checked after decoding,
+          so a hostile pipe cannot make pwsafe allocate without bound.
+        </p>
+        <p>
+          Hiding input is itself a console API exercise. Echo-off is a
+          <code>SetConsoleMode</code> change, which means a Ctrl+C during the
+          prompt can leave the terminal in a broken state. pwsafe captures the
+          original mode with <code>GetConsoleMode</code>, registers a handler
+          with <code>SetConsoleCtrlHandler</code>, and restores it both in the
+          handler and when the guard drops. It is a small detail that makes the
+          difference between a hidden prompt and a terminal that echoes nothing
+          afterwards.
+        </p>
+
+        <h2>The vault file is where the Windows gotchas live</h2>
+        <p>
+          Writes are atomic: a uniquely named temp file created with
+          <code>create_new</code>, flushed with <code>sync_all</code>, then
+          <code>ReplaceFileW</code> onto the vault. That last API matters
+          because it preserves the destination's ACLs; a plain rename does not.
+          Read-modify-write cycles are serialized with a blocking
+          <code>LockFileEx</code> on a sibling <code>.lock</code> file, so two
+          concurrent invocations cannot lose an entry. A vault that fails to
+          decrypt is never treated as empty and never overwritten, because
+          "corrupt" and "new" must not lead to the same code path.
+        </p>
+        <p>
+          The vault path itself is validated: absolute, on a local drive, with
+          UNC and device prefixes and reserved device names rejected. DPAPI
+          protects the bytes, not where you were tricked into writing them, and
+          a path is untrusted input like any other.
+        </p>
+
+        <h2>Keys that cannot spoof the terminal</h2>
+        <p>
+          Entry names are restricted to 1–128 printable ASCII characters, which
+          is a security rule rather than a style one. ANSI escape sequences in
+          a key would let stored names repaint the terminal during
+          <code>pwsafe list</code>, and Unicode bidi characters would let one
+          name render as another. Refusing both means the list output is what
+          it looks like.
+        </p>
+
+        <h2>What it does not protect against</h2>
+        <p>
+          The threat model is written down in the README because the honest list
+          is short and specific: other processes running as the same user
+          (malware, or anything reading the clipboard while the secret is on
+          it), administrators and SYSTEM, offline attacks by someone who can
+          extract your Windows credentials, clipboard entries created before
+          history exclusion or by other tools, and loss of the Windows profile.
+          Security software that promises more than this is usually describing
+          a different threat than the one you have.
+        </p>
+
+        <h2>Testing</h2>
+        <p>
+          Unit and property tests are the backbone: proptest cases assert that
+          the stdin parser and the vault path validator never panic, and that
+          every accepted input satisfies its invariants (no line breaks, within
+          the byte budget; absolute, local, non-reserved paths). DPAPI has its
+          tamper and entropy tests, and the clipboard delay bounds are tested at
+          the edges (<code>0</code> and <code>86400</code> valid, one past
+          invalid).
+        </p>
+        <p>
+          CI runs the standard Rust gates — <code>cargo fmt</code>, clippy with
+          warnings denied, <code>cargo test</code> — plus
+          <code>cargo deny</code> pinned to
+          <code>x86_64-pc-windows-msvc</code>, which denies yanked,
+          unmaintained, and unsound crates, unknowns sources, and duplicate
+          versions. Custom semgrep rules block what a password safe should never
+          do: direct printing, process spawning, environment mutation, and file
+          writes outside <code>vault.rs</code>.
+        </p>
+
+        <h2>Trade-offs</h2>
+        <p>
+          Windows-only, single-user, and no recovery: if the profile dies, the
+          vault dies with it. In exchange there is no master password to
+          forget, lose, or reuse, and no plaintext ever touches the disk or the
+          terminal. For a personal machine where the Windows account is already
+          the thing you defend, that is the right side of the trade.
+        </p>
+
+        <h2>Try it</h2>
+        <p>
+          Source and build instructions are on
+          <a href="https://github.com/nicknad/pwsafe" target="_blank" rel="noopener">GitHub</a>.
+        </p>
+      </div>
+
+      <a class="back" href="../blogs.html">← Back to all posts</a>
+    </article>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>© <span data-year>2026</span> Nick Nadolski</span>
+      <div class="social">
+        <a href="https://github.com/nicknad" target="_blank" rel="noopener" aria-label="GitHub">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+          </svg>
+        </a>
+        <a href="https://www.linkedin.com/in/nick-nadolski-91697a120/" target="_blank" rel="noopener"
+          aria-label="LinkedIn">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z" />
+          </svg>
+        </a>
+        <a href="https://x.com/nick_nadolski" target="_blank" rel="noopener" aria-label="X">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M18.901 1.153h3.68l-8.04 9.19L24 22.846h-7.406l-5.8-7.584-6.638 7.584H.474l8.6-9.83L0 1.154h7.594l5.243 6.932ZM17.61 20.644h2.039L6.486 3.24H4.298Z" />
+          </svg>
+        </a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="../js/main.js"></script>
+</body>
+
+</html>
