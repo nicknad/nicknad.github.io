@@ -8,17 +8,10 @@ https://nicknad.github.io.
 | File | Purpose |
 | --- | --- |
 | `index.html` | Home: intro, experience, education, selected projects |
-| `projects.html` | All public GitHub projects |
-| `blogs.html` | Blog index |
-| `blog/*.html` | Individual blog posts |
+| `projects.html` | Pinned GitHub projects, in pinned order |
+| `blogs.html` | Blog index (coming soon) |
 | `css/style.css` | Site styles (light and dark via `prefers-color-scheme`) |
 | `js/main.js` | Footer year |
-
-## Adding a blog post
-
-1. Copy an existing post in `blog/` and rename the file.
-2. Update the title, meta description, date, and content.
-3. Add an entry to the list in `blogs.html`.
 
 There is no build step: plain HTML, CSS, and a few lines of JavaScript.
 
